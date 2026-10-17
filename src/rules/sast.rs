@@ -111,7 +111,7 @@ pub fn sast_rules() -> Vec<SastRule> {
             "cmd-injection-php",
             "Command injection - PHP exec/system/passthru",
             Critical,
-            r#"(?:exec|system|passthru|shell_exec|popen|proc_open)\s*\(\s*\$"#,
+            r#"(?:^|[^\w>:$])(?:exec|system|passthru|shell_exec|popen|proc_open)\s*\(\s*\$"#,
             PHP,
         ),
         // Path Traversal
@@ -262,4 +262,44 @@ pub fn sast_rules() -> Vec<SastRule> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn php_cmd_rule() -> SastRule {
+        sast_rules()
+            .into_iter()
+            .find(|r| r.id == "cmd-injection-php")
+            .unwrap()
+    }
+
+    #[test]
+    fn cmd_injection_php_flags_real_functions() {
+        let re = php_cmd_rule().regex;
+        for line in [
+            "exec($cmd);",
+            "    system($x);",
+            "$out = shell_exec($y);",
+            "if (\\exec($c)) {}",
+            "passthru( $c );",
+        ] {
+            assert!(re.is_match(line), "should match: {line}");
+        }
+    }
+
+    #[test]
+    fn cmd_injection_php_ignores_lookalikes_and_methods() {
+        let re = php_cmd_rule().regex;
+        for line in [
+            "$response = curl_exec($ch);",
+            "fpassthru($stream);",
+            "fpassthru($payload->stream);",
+            "$pdo->exec($sql);",
+            "Db::exec($sql);",
+        ] {
+            assert!(!re.is_match(line), "should not match: {line}");
+        }
+    }
 }
