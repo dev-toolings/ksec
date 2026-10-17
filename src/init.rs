@@ -17,7 +17,7 @@ pre-commit:
       fail_text: "SAST findings — run `ksec sast` for details"
 
     ksec-obfuscation:
-      glob: "*.config.{js,mjs,cjs,ts}"
+      glob: "*.{js,mjs,cjs,ts,tsx,jsx,py,pth}"
       run: ksec obfuscation .
       fail_text: "obfuscated code detected — run `ksec obfuscation` for details"
 

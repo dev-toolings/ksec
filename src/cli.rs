@@ -22,6 +22,16 @@ pub struct Cli {
     /// Only show findings at or above this severity
     #[arg(long, global = true, default_value = "low")]
     pub min_severity: String,
+
+    /// Policy profile: `dev` lets through what a dev machine holds by design
+    /// (.env.example, local databases, CI credentials, fixtures). Obfuscation
+    /// is never hidden. Overrides `profile` in .ksec.toml
+    #[arg(long, global = true, value_parser = ["strict", "dev"])]
+    pub profile: Option<String>,
+
+    /// Ignore .ksec.toml, the dev profile and the baseline: show everything
+    #[arg(long, global = true)]
+    pub no_policy: bool,
 }
 
 #[derive(Subcommand)]
@@ -51,11 +61,20 @@ pub enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Detect obfuscated code in config files (long lines, global[], hex payloads)
+    /// Detect obfuscated payloads in code and installed dependencies (GlassWorm invisible
+    /// Unicode, obfuscator.io, decode+exec loaders, .pth, Trojan Source)
     Obfuscation {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Record current findings in .ksec-baseline.json so later scans only show new ones
+    /// (obfuscation and critical supply-chain findings are never baselined)
+    Baseline {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Print the sha256 to put in an [[allow]] entry that validates a protected finding
+    Hash { file: PathBuf },
     /// Generate lefthook.yml for pre-commit hooks
     Init {
         /// Overwrite existing lefthook.yml

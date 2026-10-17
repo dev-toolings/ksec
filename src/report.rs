@@ -1,3 +1,4 @@
+use crate::policy::{Profile, Suppressed};
 use crate::scanner::{ScanResult, Severity};
 use colored::Colorize;
 
@@ -22,7 +23,11 @@ fn parse_min_severity(s: &str) -> Severity {
     }
 }
 
-pub fn print_report(results: &[ScanResult], min_severity: &str) {
+pub fn print_report(
+    results: &[ScanResult],
+    min_severity: &str,
+    suppressed: Option<(Suppressed, Profile)>,
+) {
     let min = parse_min_severity(min_severity);
     println!();
     println!("{}", "═══ ksec scan report ═══".bold());
@@ -94,6 +99,28 @@ pub fn print_report(results: &[ScanResult], min_severity: &str) {
             "0".green().bold()
         }
     );
+    match suppressed {
+        Some((s, profile)) => {
+            let label = match profile {
+                Profile::Dev => "dev",
+                Profile::Strict => "strict",
+            };
+            println!(
+                "  policy:   profile {}, {} suppressed ({} profile, {} allowlist, {} baseline){}",
+                label.bold(),
+                s.total(),
+                s.profile,
+                s.allow,
+                s.baseline,
+                if s.total() > 0 {
+                    " -- --no-policy to show"
+                } else {
+                    ""
+                }
+            );
+        }
+        None => println!("  policy:   disabled (--no-policy)"),
+    }
     println!();
 }
 

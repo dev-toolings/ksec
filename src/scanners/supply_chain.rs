@@ -40,7 +40,15 @@ fn has_encoded_blob(content: &str) -> bool {
 }
 
 fn scan_known_malware_files(target: &Path, findings: &mut Vec<Finding>) {
-    const IOC_FILES: &[&str] = &["Math_Symbol.js", "math_init.js", "setup.mjs"];
+    // `setup_bun.js` / `bun_environment.js` : Shai-Hulud 2.0, le preinstall
+    // installe Bun pour lancer la charge hors des garde-fous de Node.
+    const IOC_FILES: &[&str] = &[
+        "Math_Symbol.js",
+        "math_init.js",
+        "setup.mjs",
+        "setup_bun.js",
+        "bun_environment.js",
+    ];
     // Ce scan est le seul à descendre dans les dépendances installées : c'est
     // là, et nulle part ailleurs, que la charge est déposée.
     let files = walk::walk_files_including_deps(target);
@@ -54,7 +62,11 @@ fn scan_known_malware_files(target: &Path, findings: &mut Vec<Finding>) {
                 .to_string_lossy()
                 .to_string();
 
-            let flagged = fs::read_to_string(file_path).is_ok_and(|c| looks_malicious(&c));
+            // La charge de Shai-Hulud 2.0 pèse ~10 Mo d'obfuscator.io : sa
+            // taille la trahit autant que son contenu.
+            let flagged = (name == "bun_environment.js"
+                && fs::metadata(file_path).is_ok_and(|m| m.len() > 1024 * 1024))
+                || fs::read_to_string(file_path).is_ok_and(|c| looks_malicious(&c));
 
             if flagged {
                 findings.push(Finding {
@@ -65,7 +77,8 @@ fn scan_known_malware_files(target: &Path, findings: &mut Vec<Finding>) {
                     file: Some(relative),
                     line: None,
                     detail: Some(
-                        "Indicator matches the keyv & friends supply-chain worm (Aug 2026)".into(),
+                        "Indicator matches the Shai-Hulud worm family (2.0 Bun loader, keyv Aug 2026)"
+                            .into(),
                     ),
                 });
             }

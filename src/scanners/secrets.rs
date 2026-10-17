@@ -163,6 +163,25 @@ fn is_allowlisted(line: &str) -> bool {
     ALLOWLIST_PATTERNS.iter().any(|p| line.contains(p))
 }
 
+/// Valeur qui désigne un secret au lieu de le contenir : variable shell
+/// (`"$DB_PASSWORD"`, `"$(openssl rand -hex 32)"`), paramètre Symfony
+/// (`'%app.secret%'`), nom de variable d'environnement (`"PVE_TOKEN_SECRET"`),
+/// gabarit (`"<token>"`).
+fn is_reference_value(assignment: &str) -> bool {
+    let Some(start) = assignment.find(['"', '\'']) else {
+        return false;
+    };
+    let value = assignment[start + 1..assignment.len() - 1].trim();
+    value.starts_with('$')
+        || value.starts_with('<')
+        || (value.starts_with('%') && value.ends_with('%'))
+        || (value.len() >= 3
+            && value.starts_with(|c: char| c.is_ascii_uppercase())
+            && value
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+}
+
 impl Scanner for SecretsScanner {
     fn name(&self) -> &str {
         "secrets"
@@ -214,7 +233,10 @@ impl Scanner for SecretsScanner {
                 }
 
                 for rule in &rules {
-                    if rule.regex.is_match(line) {
+                    if let Some(m) = rule.regex.find(line) {
+                        if rule.id == "password-assignment" && is_reference_value(m.as_str()) {
+                            continue;
+                        }
                         findings.push(Finding {
                             severity: rule.severity,
                             category: Category::Secrets,
@@ -230,5 +252,19 @@ impl Scanner for SecretsScanner {
             }
         }
         findings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn references_to_a_secret_are_not_the_secret() {
+        assert!(is_reference_value(r#"PASSWORD="$(openssl rand -hex 32)""#));
+        assert!(is_reference_value(r#"DB_PASSWORD="$DB_PASSWORD""#));
+        assert!(is_reference_value("$secret: '%app.secret%'"));
+        assert!(is_reference_value(r#"EnvToken = "CF_API_TOKEN""#));
+        assert!(!is_reference_value(r#"password: "Xk2!pq9Lm""#));
     }
 }

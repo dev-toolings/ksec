@@ -74,6 +74,18 @@ ksec scan --json .
 # Filter by severity
 ksec scan --min-severity high .
 
+# Dev machine: let through what a dev box holds by design (see Policy)
+ksec scan --profile dev ~/lab
+
+# Freeze the remaining findings, then only see new ones
+ksec baseline ~/lab
+
+# Validate one protected finding (obfuscation) by its exact content
+ksec hash node_modules/some-pkg/dist/index.js
+
+# Show everything, ignoring .ksec.toml, profile and baseline
+ksec scan --no-policy .
+
 # Generate pre-commit hooks (lefthook)
 ksec init
 ```
@@ -132,11 +144,67 @@ Static analysis for common security vulnerabilities:
 
 ### Obfuscation
 
-Detects obfuscated code in config files (`.config.js`, `.config.mjs`, etc.):
+Runs first and is the priority scanner. It reads every JS/TS/Python file,
+**including installed dependencies** (`node_modules`, `site-packages`, and
+VS Code / Cursor `extensions`), because that is where droppers land. Rules
+follow the 2025-2026 campaigns:
 
-- Lines longer than 500 characters
-- `global[]` accessor patterns
-- Heavy hex-encoded content (`\x41\x42...`)
+| Rule | Catches | Severity |
+|---|---|---|
+| `invisible-unicode-payload` | runs of Unicode variation selectors / tags hiding bytes, decoded via `codePointAt` + `eval` (GlassWorm) | High, Critical with a decoder |
+| `obfuscator-io` | `_0x1a2b` identifiers, string array rotation `while(!![])` (npm stagers, Microsoft May 2026) | High, Critical with rotation |
+| `decode-exec-chain` | `eval(atob(...))`, `exec(zlib.decompress(b64decode(...[::-1])))` (PyPI one-line loaders 2026) | Critical |
+| `encoded-blob-exec` | a large base64 blob fed to `eval` / `exec` / `Function` on the same line | High |
+| `pth-startup-exec` | `.pth` files that decode or fetch code at every Python start | Critical |
+| `bidi-control` | Trojan Source bidirectional controls in project code | High |
+| `config-*` | long lines, `global[]`, hex payloads in `*.config.*` files | Medium / High |
+
+Any suspicious file that also exits under CI and runs detached
+(`process.env.CI` + `.unref()`) is escalated to Critical. WebAssembly
+modules (`AGFzbQ...`), `data:` URIs and source maps are not payloads.
+
+The supply-chain scanner also knows the Shai-Hulud 2.0 files
+(`setup_bun.js`, `bun_environment.js`).
+
+## Policy: `.ksec.toml`, dev profile, baseline
+
+`ksec` looks for `.ksec.toml` in the scanned directory, then in its parents:
+one file in `~/lab` covers every project below it.
+
+```toml
+profile = "dev"          # or "strict" (default); --profile overrides it
+
+[[allow]]
+rule = "db-uri-password"            # rule id, title substring, or "*"
+path = "tools/ploydok/apps/api/src/databases/templates/**"   # glob, relative to this file
+reason = "connection string templates, rendered at deploy time"   # required
+
+[[allow]]
+rule = "decode-exec-chain"
+path = "scraping/**/ublock-badware.js"
+sha256 = "<output of ksec hash>"    # required for protected findings
+reason = "uBlock Origin badware scriptlets: signatures, not code"
+```
+
+Filters apply in this order:
+
+1. **Profile `dev`** lets through `.env.example` and other templates, database
+   URIs that point at localhost / `infra-*` / a compose service, CI
+   credentials, tests, fixtures and seeds, i18n labels, mock values and
+   `DEV_*` / `DEMO_*` / `SEED_*` constants, and `fetch` / WebSocket in
+   first-party code.
+2. **`[[allow]]`** entries, each with a mandatory `reason`.
+3. **Baseline** (`.ksec-baseline.json`, written by `ksec baseline` next to
+   `.ksec.toml`): findings keyed by rule, file and line content, so they
+   survive a line move but come back when the line changes.
+
+**Protected findings are never hidden by the profile or the baseline:**
+everything from the obfuscation scanner and every critical supply-chain
+finding. An `[[allow]]` validates one only with the file's exact `sha256`;
+if the file changes by one byte, the finding comes back.
+
+The report prints how many findings each filter suppressed; `--no-policy`
+shows them all.
 
 ## `.ksecignore`
 
@@ -199,7 +267,7 @@ ksec scan --json . | jq '.[] | select(.findings | length > 0)'
 | Code | Meaning |
 |---|---|
 | `0` | No high/critical findings |
-| `1` | High or critical findings detected |
+| `1` | High or critical findings detected (after policy) |
 
 ## Architecture
 

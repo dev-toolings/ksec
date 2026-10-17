@@ -65,6 +65,42 @@ const BINARY_EXTENSIONS: &[&str] = &[
     "a", "wasm", "pyc", "pyo", "class", "sqlite", "db",
 ];
 
+/// Répertoires où atterrit du code tiers installé : un dropper ne se pose
+/// jamais dans le code du projet, il se pose là. `extensions` couvre les
+/// extensions VS Code / Cursor (GlassWorm), `site-packages` les paquets Python
+/// (fichiers `.pth` exécutés au démarrage de l'interpréteur).
+const DEP_ROOTS: &[&str] = &[
+    "node_modules",
+    "site-packages",
+    "dist-packages",
+    "extensions",
+];
+
+/// Dossiers de SKIP_DIRS qu'il faut traverser pour atteindre un DEP_ROOTS :
+/// `.venv/lib/python3.x/site-packages`, `.vscode/extensions`.
+const DEP_CONTAINERS: &[&str] = &[".venv", "venv"];
+const EDITOR_DIRS: &[&str] = &[".vscode", ".vscode-server", ".cursor", ".cursor-server"];
+
+/// Chemin relatif qui tombe dans du code tiers installé.
+pub fn is_dependency_path(relative: &str) -> bool {
+    inside_dep_root(Path::new(relative))
+}
+
+fn inside_dep_root(path: &Path) -> bool {
+    let parts: Vec<_> = path.components().map(|c| c.as_os_str()).collect();
+    parts.iter().enumerate().any(|(i, c)| {
+        if *c == "extensions" {
+            // `extensions` n'est un magasin de code tiers que sous un éditeur.
+            i > 0
+                && parts[i - 1]
+                    .to_str()
+                    .is_some_and(|p| EDITOR_DIRS.contains(&p))
+        } else {
+            DEP_ROOTS.iter().any(|r| *c == *r)
+        }
+    })
+}
+
 fn load_ksecignore(target: &Path) -> Option<ignore::overrides::Override> {
     let ignore_path = target.join(".ksecignore");
     let content = fs::read_to_string(&ignore_path).ok()?;
@@ -124,17 +160,16 @@ fn collect(target: &Path, include_deps: bool) -> Vec<PathBuf> {
                 return true;
             }
             if include_deps {
-                if name == "node_modules" {
+                if DEP_ROOTS.contains(&name)
+                    || DEP_CONTAINERS.contains(&name)
+                    || EDITOR_DIRS.contains(&name)
+                {
                     return true;
                 }
                 // Une fois à l'intérieur d'un node_modules, plus aucun filtre de
                 // bruit : la charge se cache justement dans `dist/` et le magasin
                 // de bun est un `.bun/`, deux noms présents dans SKIP_DIRS.
-                if entry
-                    .path()
-                    .components()
-                    .any(|c| c.as_os_str() == "node_modules")
-                {
+                if inside_dep_root(entry.path()) {
                     return name != ".git";
                 }
             }
