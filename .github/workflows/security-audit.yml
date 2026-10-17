@@ -1,9 +1,9 @@
-name: Security Audit (Daily)
+name: Security Audit (Weekly)
 
 on:
   schedule:
-    # 03h00 Paris = 01h00 UTC
-    - cron: "0 1 * * *"
+    # Lundi 03h00 Paris = 01h00 UTC
+    - cron: "0 1 * * 1"
   workflow_dispatch:
   push:
     paths:
