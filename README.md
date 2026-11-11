@@ -165,6 +165,9 @@ follow the 2025-2026 campaigns:
 | `vscode-folderopen-task` | `.vscode/tasks.json` task with `runOn: folderOpen` | Medium, Critical when it runs node or a font |
 | `node-init-script`, `extensionless-js-loader` | `"dev": "node init && ..."` and the extensionless `init` file holding JavaScript | High / Critical |
 | `config-bat-dropper`, `gitignore-config-bat` | `config.bat` and the `.gitignore` line that hides it | Medium / High |
+| `chain-c2-loader` | code that reads a blockchain transaction (`eth_getTransactionByHash`, trongrid, ethplorer) and runs it through `subprocess` / `child_process` / `eval` | Critical |
+| `env-remote-eval` | `atob(process.env.X)` or a base64 env value decoded, downloaded, then `eval`-ed within the next 1000 bytes | Critical |
+| `env-base64-url` | a `.env*` value that is a base64-encoded `http(s)://` URL (hidden C2 address) | High |
 
 Any suspicious file that also exits under CI and runs detached
 (`process.env.CI` + `.unref()`) is escalated to Critical. WebAssembly

