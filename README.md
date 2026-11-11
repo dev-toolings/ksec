@@ -144,7 +144,8 @@ Static analysis for common security vulnerabilities:
 
 ### Obfuscation
 
-Runs first and is the priority scanner. It reads every JS/TS/Python file,
+Runs first and is the priority scanner. It reads every JS/TS/Python file
+(plus fonts, `package.json`, `.gitignore`, `init` and `.vscode/tasks.json` for PolinRider),
 **including installed dependencies** (`node_modules`, `site-packages`, and
 VS Code / Cursor `extensions`), because that is where droppers land. Rules
 follow the 2025-2026 campaigns:
@@ -158,6 +159,12 @@ follow the 2025-2026 campaigns:
 | `pth-startup-exec` | `.pth` files that decode or fetch code at every Python start | Critical |
 | `bidi-control` | Trojan Source bidirectional controls in project code | High |
 | `config-*` | long lines, `global[]`, hex payloads in `*.config.*` files | Medium / High |
+| `polinrider-marker` | campaign marker `'-5289-1'` / `global['!']='9-5289-1'` in any code or config file (PolinRider 2026) | Critical |
+| `config-space-hidden-code`, `config-chain-c2` | payload pushed off-screen by 150+ spaces; `api.trongrid.io` / `eth_getTransactionByHash` C2 in a config | High / Critical |
+| `font-disguised-script` | a `.ttf` / `.otf` / `.woff*` / `.eot` whose first bytes are text: a script disguised as a font (Git LFS pointers excluded) | Critical |
+| `vscode-folderopen-task` | `.vscode/tasks.json` task with `runOn: folderOpen` | Medium, Critical when it runs node or a font |
+| `node-init-script`, `extensionless-js-loader` | `"dev": "node init && ..."` and the extensionless `init` file holding JavaScript | High / Critical |
+| `config-bat-dropper`, `gitignore-config-bat` | `config.bat` and the `.gitignore` line that hides it | Medium / High |
 
 Any suspicious file that also exits under CI and runs detached
 (`process.env.CI` + `.unref()`) is escalated to Critical. WebAssembly

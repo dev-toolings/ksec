@@ -2,6 +2,7 @@ use crate::scanner::{Category, Finding, Scanner, Severity};
 use crate::walk;
 use regex::Regex;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -88,6 +89,214 @@ static GLOBAL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"global\[|_\$_[0-9a-f]"#).unwrap());
 static HEX_HEAVY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\x[0-9a-fA-F]{2}(?:\\x[0-9a-fA-F]{2}){20,}").unwrap());
+
+/// PolinRider (2026) : marqueur de campagne `var z = '-5289-1'` ou
+/// `global['!']='9-5289-1'` en tête de la charge.
+static POLINRIDER_MARKER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"['"]\d?-5289-\d+['"]"#).unwrap());
+
+/// Charge collée en fin de ligne d'une config, poussée hors de l'écran par une
+/// longue suite d'espaces.
+static SPACE_HIDDEN_CODE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\S {150,}\S").unwrap());
+
+/// Commande C2 lue dans une transaction blockchain.
+static CHAIN_C2_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"api\.trongrid\.io|eth_getTransactionByHash").unwrap());
+
+/// `"dev": "node init && next dev"` : le fichier `init` sans extension est le
+/// chargeur, quel que soit l'enchaînement qui suit (`&&`, `;`, `||`, rien).
+static NODE_INIT_SCRIPT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#":\s*"[^"]*\bnode\s+(?:\./)?init["\s;&|]"#).unwrap());
+
+static NODE_CMD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bnode(?:\.exe)?\b|\.(?:ttf|otf|woff2?|eot)\b").unwrap());
+
+static JS_LOADER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\brequire\s*\(|child_process|\beval\s*\(|\bFunction\s*\(|module\.exports").unwrap()
+});
+
+/// Fichiers que seule la recherche d'IOC PolinRider doit ouvrir.
+fn is_polinrider_file(file_path: &Path, filename: &str, ext: &str) -> bool {
+    walk::FONT_EXTENSIONS.contains(&ext)
+        || filename == "package.json"
+        || filename == ".gitignore"
+        || filename == "init"
+        || filename.eq_ignore_ascii_case("config.bat")
+        || (filename == "tasks.json"
+            && file_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|p| p == ".vscode"))
+}
+
+/// Début d'une police qui est en fait du texte. Un pointeur Git LFS est le
+/// texte normal d'une police non récupérée ; un BOM ou un identifiant non
+/// ASCII ne doivent pas suffire à masquer un script.
+fn font_head_is_text(head: &[u8]) -> bool {
+    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    if head.starts_with(b"version https://git-lfs") {
+        return false;
+    }
+    // Les 64 octets peuvent couper un caractère UTF-8 en deux.
+    let text = match std::str::from_utf8(head) {
+        Ok(t) => t,
+        Err(e) if e.error_len().is_none() => {
+            std::str::from_utf8(&head[..e.valid_up_to()]).unwrap_or_default()
+        }
+        Err(_) => return false,
+    };
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+}
+
+/// Gravité d'un `tasks.json` : CRITICAL quand la tâche lancée à l'ouverture
+/// appelle node ou une police, MEDIUM pour un watcher ordinaire. Un fichier
+/// JSONC (commentaires) qui ne se parse pas reste HIGH.
+fn folder_open_severity(content: &str) -> Severity {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Severity::High;
+    };
+    let tasks = json["tasks"].as_array().cloned().unwrap_or_default();
+    let mut on_open = tasks
+        .iter()
+        .filter(|t| t["runOptions"]["runOn"] == "folderOpen")
+        .peekable();
+    if on_open.peek().is_none() {
+        return Severity::High;
+    }
+    if on_open.any(|t| NODE_CMD_RE.is_match(&t.to_string())) {
+        Severity::Critical
+    } else {
+        Severity::Medium
+    }
+}
+
+fn first_line_matching(content: &str, re: &Regex) -> Option<u32> {
+    re.find(content).map(|m| line_of(content, m.start()))
+}
+
+/// Indicateurs PolinRider : chargeur JS déguisé en police, tâche VS Code
+/// lancée à l'ouverture du dossier, script `node init &&`, `config.bat` et sa
+/// ligne de `.gitignore`, marqueur de campagne, C2 sur blockchain.
+fn scan_polinrider(relative: &str, filename: &str, ext: &str, bytes: &[u8]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut push = |severity, rule: &str, title: &str, line: Option<u32>| {
+        out.push(finding(
+            severity,
+            rule,
+            title.into(),
+            relative,
+            line,
+            Some("PolinRider indicator".into()),
+        ));
+    };
+
+    if walk::FONT_EXTENSIONS.contains(&ext) {
+        if font_head_is_text(&bytes[..bytes.len().min(64)]) {
+            push(
+                Severity::Critical,
+                "font-disguised-script",
+                "font file is plain text: disguised script",
+                Some(1),
+            );
+        }
+        return out;
+    }
+    if filename.eq_ignore_ascii_case("config.bat") {
+        // Celui de PolinRider relance node ; un vrai script Windows non.
+        let severity = if String::from_utf8_lossy(bytes)
+            .to_ascii_lowercase()
+            .contains("node")
+        {
+            Severity::High
+        } else {
+            Severity::Medium
+        };
+        push(severity, "config-bat-dropper", "config.bat dropper", None);
+        return out;
+    }
+
+    let content = String::from_utf8_lossy(bytes);
+    match filename {
+        ".gitignore" => {
+            if let Some(i) = content.lines().position(|l| {
+                let entry = l.trim();
+                let entry = entry
+                    .strip_prefix("**/")
+                    .or_else(|| entry.strip_prefix('/'))
+                    .unwrap_or(entry);
+                entry.eq_ignore_ascii_case("config.bat")
+            }) {
+                push(
+                    Severity::High,
+                    "gitignore-config-bat",
+                    "config.bat hidden by .gitignore",
+                    Some(i as u32 + 1),
+                );
+            }
+        }
+        "package.json" => {
+            if let Some(line) = first_line_matching(&content, &NODE_INIT_SCRIPT_RE) {
+                push(
+                    Severity::Critical,
+                    "node-init-script",
+                    "npm script runs an extensionless `init` loader",
+                    Some(line),
+                );
+            }
+        }
+        "tasks.json" => {
+            if let Some(at) = content.find("folderOpen") {
+                let line = line_of(&content, at);
+                let severity = folder_open_severity(&content);
+                let title = if severity == Severity::Critical {
+                    "VS Code task runs node when the folder opens"
+                } else {
+                    "VS Code task runs when the folder opens"
+                };
+                push(severity, "vscode-folderopen-task", title, Some(line));
+            }
+        }
+        // Un script shell `init` est banal ; un shebang node ne l'est pas.
+        "init"
+            if !(content.starts_with("#!")
+                && !content.lines().next().unwrap_or("").contains("node"))
+                && JS_LOADER_RE.is_match(&content) =>
+        {
+            let severity =
+                if CHAIN_C2_RE.is_match(&content) || POLINRIDER_MARKER_RE.is_match(&content) {
+                    Severity::Critical
+                } else {
+                    Severity::High
+                };
+            push(
+                severity,
+                "extensionless-js-loader",
+                "extensionless `init` file holds JavaScript",
+                Some(1),
+            );
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Marqueur de campagne PolinRider, dans tout fichier de code ou de config.
+fn scan_campaign_marker(relative: &str, content: &str) -> Option<Finding> {
+    first_line_matching(content, &POLINRIDER_MARKER_RE).map(|line| {
+        finding(
+            Severity::Critical,
+            "polinrider-marker",
+            "PolinRider campaign marker (-5289-)".into(),
+            relative,
+            Some(line),
+            Some("PolinRider indicator".into()),
+        )
+    })
+}
 
 fn is_config_file(filename: &str) -> bool {
     CONFIG_PATTERNS.iter().any(|pat| {
@@ -420,6 +629,26 @@ fn scan_config(relative: &str, content: &str) -> Vec<Finding> {
                 None,
             ));
         }
+        if SPACE_HIDDEN_CODE_RE.is_match(line) {
+            out.push(finding(
+                Severity::High,
+                "config-space-hidden-code",
+                "code pushed off-screen by a long run of spaces".into(),
+                relative,
+                line_no,
+                None,
+            ));
+        }
+        if CHAIN_C2_RE.is_match(line) {
+            out.push(finding(
+                Severity::Critical,
+                "config-chain-c2",
+                "config file reads commands from a blockchain transaction".into(),
+                relative,
+                line_no,
+                None,
+            ));
+        }
         if HEX_HEAVY_RE.is_match(line) {
             out.push(finding(
                 Severity::High,
@@ -443,30 +672,46 @@ fn scan_file(target: &Path, file_path: &Path) -> Vec<Finding> {
         .unwrap_or_default();
     let config = is_config_file(filename);
     let code = CODE_EXTENSIONS.contains(&ext.as_str()) && !filename.ends_with(".d.ts");
-    if !config && !code {
+    let ioc = is_polinrider_file(file_path, filename, &ext);
+    if !config && !code && !ioc {
         return Vec::new();
     }
-    if fs::metadata(file_path).is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
+    // Pour une police, seuls les 64 premiers octets servent.
+    let bytes = if walk::FONT_EXTENSIONS.contains(&ext.as_str()) {
+        fs::File::open(file_path).and_then(|f| {
+            let mut head = Vec::with_capacity(64);
+            f.take(64).read_to_end(&mut head).map(|_| head)
+        })
+    } else if fs::metadata(file_path).is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
         return Vec::new();
-    }
-    let Ok(bytes) = fs::read(file_path) else {
+    } else {
+        fs::read(file_path)
+    };
+    let Ok(bytes) = bytes else {
         return Vec::new();
     };
-    let content = String::from_utf8_lossy(&bytes);
     let relative = file_path
         .strip_prefix(target)
         .unwrap_or(file_path)
         .to_string_lossy()
         .to_string();
-
-    let mut out = if code {
-        scan_content(&relative, &content)
+    let mut out = if ioc {
+        scan_polinrider(&relative, filename, &ext, &bytes)
     } else {
         Vec::new()
     };
+    if !config && !code {
+        return out;
+    }
+    let content = String::from_utf8_lossy(&bytes);
+
+    if code {
+        out.extend(scan_content(&relative, &content));
+    }
     if config {
         out.extend(scan_config(&relative, &content));
     }
+    out.extend(scan_campaign_marker(&relative, &content));
     out
 }
 
@@ -614,6 +859,128 @@ mod tests {
         assert!(scan_content("site-packages/__editable__.foo.pth", ok).is_empty());
         let coverage = r#"import sys; exec('import os\nif os.getenv("COVERAGE_PROCESS_START"):\n import coverage')"#;
         assert!(scan_content("site-packages/a1_coverage.pth", coverage).is_empty());
+    }
+
+    fn polinrider(relative: &str, bytes: &[u8]) -> Vec<String> {
+        let p = Path::new(relative);
+        let name = p.file_name().unwrap().to_str().unwrap();
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        assert!(is_polinrider_file(p, name, ext), "{relative} not routed");
+        rules(&scan_polinrider(relative, name, ext, bytes))
+    }
+
+    #[test]
+    fn polinrider_font_loader_is_flagged_and_real_font_is_not() {
+        let js = b"var z = '-5289-1'; require('child_process').exec(x);";
+        assert!(
+            polinrider("public/fonts/fa-solid-600.ttf", js)[0].contains("font-disguised-script")
+        );
+        let ttf = [
+            0u8, 1, 0, 0, 0, 0x0c, 0, 0x80, 0, 3, 0, 0x40, b'O', b'S', b'/', b'2',
+        ];
+        assert!(polinrider("public/fonts/inter.ttf", &ttf).is_empty());
+    }
+
+    #[test]
+    fn polinrider_folder_open_task_running_node_is_critical() {
+        let task = br#"{"tasks":[{"command":"node public/fonts/fa-solid-600.ttf","runOptions":{"runOn":"folderOpen"}}]}"#;
+        let found = scan_polinrider(".vscode/tasks.json", "tasks.json", "json", task);
+        assert_eq!(found[0].severity, Severity::Critical, "{found:?}");
+    }
+
+    #[test]
+    fn polinrider_node_init_script_is_flagged_and_plain_node_is_not() {
+        let evil = br#"{"scripts":{"dev":"node init && next dev"}}"#;
+        assert!(polinrider("package.json", evil)[0].contains("node-init-script"));
+        let ok =
+            br#"{"scripts":{"dev":"node index.js && next dev","init":"node scripts/init.js"}}"#;
+        assert!(polinrider("package.json", ok).is_empty());
+    }
+
+    #[test]
+    fn polinrider_extensionless_js_init_is_flagged_and_shell_init_is_not() {
+        let js = b"const h=require('https');h.get('https://api.trongrid.io/v1/x');";
+        let found = scan_polinrider("init", "init", "", js);
+        assert_eq!(found[0].severity, Severity::Critical, "{found:?}");
+        assert!(polinrider("init", b"#!/bin/sh\nrequire() { :; }\n").is_empty());
+    }
+
+    #[test]
+    fn polinrider_config_bat_and_its_gitignore_line_are_flagged() {
+        assert!(
+            polinrider("config.bat", b"@echo off\r\nnode init\r\n")[0]
+                .contains("config-bat-dropper")
+        );
+        let gi = polinrider(".gitignore", b"node_modules\n.env*.local\nconfig.bat\n");
+        assert!(gi[0].contains("gitignore-config-bat"), "{gi:?}");
+        assert!(polinrider(".gitignore", b"node_modules\nconfig.bat.example\n").is_empty());
+    }
+
+    #[test]
+    fn polinrider_payload_after_spaces_in_config_is_flagged() {
+        let src = format!(
+            "export default config;{}global['!']='9-5289-1';var _$_1e42=(function(l,e){{}})();\n",
+            " ".repeat(200)
+        );
+        let found = rules(&scan_config("postcss.config.mjs", &src));
+        assert!(
+            found.iter().any(|t| t.contains("config-space-hidden-code")),
+            "{found:?}"
+        );
+        assert!(scan_campaign_marker("postcss.config.mjs", &src).is_some());
+        assert!(scan_campaign_marker("src/a.ts", "const id = 'A-5289-B';").is_none());
+    }
+
+    #[test]
+    fn polinrider_font_check_skips_lfs_pointer_and_catches_bom_and_unicode() {
+        let lfs = b"version https://git-lfs.github.com/spec/v1\noid sha256:ab\nsize 12345\n";
+        assert!(polinrider("fonts/inter.woff2", lfs).is_empty());
+        assert!(!polinrider("f/a.ttf", b"\xEF\xBB\xBFvar z=require('fs');").is_empty());
+        assert!(!polinrider("f/a.ttf", "var \u{3b6}=require('fs');".as_bytes()).is_empty());
+        let woff2 = [b'w', b'O', b'F', b'2', 0, 1, 0, 0, 0, 0, 0x5a, 0x1c];
+        assert!(polinrider("f/a.woff2", &woff2).is_empty());
+    }
+
+    #[test]
+    fn polinrider_folder_open_severity_looks_at_the_folder_open_task_only() {
+        let watcher = br#"{"tasks":[{"command":"tsc -w","runOptions":{"runOn":"folderOpen"}},{"command":"node scripts/seed.js"}]}"#;
+        let found = scan_polinrider(".vscode/tasks.json", "tasks.json", "json", watcher);
+        assert_eq!(found[0].severity, Severity::Medium, "{found:?}");
+    }
+
+    #[test]
+    fn polinrider_node_shebang_init_and_other_node_init_scripts_are_flagged() {
+        let found = polinrider(
+            "init",
+            b"#!/usr/bin/env node\nrequire('child_process').exec(x)\n",
+        );
+        assert!(found[0].contains("extensionless-js-loader"), "{found:?}");
+        for script in ["node init", "node init; next dev", "node init || true"] {
+            let pkg = format!(r#"{{"scripts":{{"postinstall":"{script}"}}}}"#);
+            assert!(
+                !polinrider("package.json", pkg.as_bytes()).is_empty(),
+                "{script}"
+            );
+        }
+        assert!(polinrider("package.json", br#"{"scripts":{"a":"node init.js"}}"#).is_empty());
+    }
+
+    #[test]
+    fn polinrider_gitignore_anchored_entries_and_plain_windows_bat() {
+        for entry in ["/config.bat", "**/config.bat"] {
+            let gi = format!("node_modules\n{entry}\n");
+            assert!(
+                !polinrider(".gitignore", gi.as_bytes()).is_empty(),
+                "{entry}"
+            );
+        }
+        let plain = scan_polinrider(
+            "config.bat",
+            "config.bat",
+            "bat",
+            b"@echo off\r\nset A=1\r\n",
+        );
+        assert_eq!(plain[0].severity, Severity::Medium);
     }
 
     #[test]

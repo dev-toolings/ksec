@@ -65,6 +65,8 @@ const BINARY_EXTENSIONS: &[&str] = &[
     "a", "wasm", "pyc", "pyo", "class", "sqlite", "db",
 ];
 
+pub const FONT_EXTENSIONS: &[&str] = &["ttf", "otf", "woff", "woff2", "eot"];
+
 /// Répertoires où atterrit du code tiers installé : un dropper ne se pose
 /// jamais dans le code du projet, il se pose là. `extensions` couvre les
 /// extensions VS Code / Cursor (GlassWorm), `site-packages` les paquets Python
@@ -187,10 +189,16 @@ fn collect(target: &Path, include_deps: bool) -> Vec<PathBuf> {
             continue;
         }
         let path = entry.path();
+        // PolinRider déguise son chargeur JS en police (`fa-solid-600.ttf`) :
+        // la recherche d'IOC doit pouvoir ouvrir les polices.
         if path
             .extension()
             .and_then(|e| e.to_str())
-            .is_some_and(|ext| BINARY_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+            .map(|ext| ext.to_lowercase())
+            .is_some_and(|ext| {
+                BINARY_EXTENSIONS.contains(&ext.as_str())
+                    && !(include_deps && FONT_EXTENSIONS.contains(&ext.as_str()))
+            })
         {
             continue;
         }
