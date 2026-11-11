@@ -130,44 +130,109 @@ fn is_polinrider_file(file_path: &Path, filename: &str, ext: &str) -> bool {
                 .is_some_and(|p| p == ".vscode"))
 }
 
-/// Début d'une police qui est en fait du texte. Un pointeur Git LFS est le
-/// texte normal d'une police non récupérée ; un BOM ou un identifiant non
-/// ASCII ne doivent pas suffire à masquer un script.
-fn font_head_is_text(head: &[u8]) -> bool {
-    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
-    if head.starts_with(b"version https://git-lfs") {
+/// Une police qui ne commence pas par une signature de police est un
+/// fichier déguisé : Node exécute un script même si un commentaire y glisse
+/// un octet NUL ou de l'UTF-8 invalide. Un pointeur Git LFS est le texte
+/// normal d'une police non récupérée.
+fn font_is_disguised(head: &[u8]) -> bool {
+    const MAGIC: &[&[u8]] = &[
+        b"\x00\x01\x00\x00",
+        b"OTTO",
+        b"true",
+        b"typ1",
+        b"ttcf",
+        b"wOFF",
+        b"wOF2",
+    ];
+    if head.is_empty() || head.starts_with(b"version https://git-lfs") {
         return false;
     }
-    // Les 64 octets peuvent couper un caractère UTF-8 en deux.
-    let text = match std::str::from_utf8(head) {
-        Ok(t) => t,
-        Err(e) if e.error_len().is_none() => {
-            std::str::from_utf8(&head[..e.valid_up_to()]).unwrap_or_default()
-        }
-        Err(_) => return false,
-    };
-    !text.is_empty()
-        && text
-            .chars()
-            .all(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+    let eot = head.get(34..36) == Some(b"LP");
+    !eot && !MAGIC.iter().any(|m| head.starts_with(m))
 }
 
-/// Gravité d'un `tasks.json` : CRITICAL quand la tâche lancée à l'ouverture
-/// appelle node ou une police, MEDIUM pour un watcher ordinaire. Un fichier
-/// JSONC (commentaires) qui ne se parse pas reste HIGH.
+/// `tasks.json` est du JSONC : commentaires et virgules finales acceptés par
+/// VS Code, refusés par serde_json.
+fn strip_jsonc(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if c == '\\' {
+                out.extend(chars.next());
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('"', _) => {
+                in_string = true;
+                out.push(c);
+            }
+            ('/', Some('/')) => {
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut prev = ' ';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    TRAILING_COMMA_RE.replace_all(&out, "$1").into_owned()
+}
+
+static TRAILING_COMMA_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r",(\s*[}\]])").unwrap());
+
+/// Gravité d'un `tasks.json` : CRITICAL quand la tâche lancée à l'ouverture,
+/// ou une tâche dont elle dépend, appelle node ou une police ; MEDIUM pour un
+/// watcher ordinaire. Un fichier illisible reste HIGH.
 fn folder_open_severity(content: &str) -> Severity {
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(content)) else {
         return Severity::High;
     };
     let tasks = json["tasks"].as_array().cloned().unwrap_or_default();
-    let mut on_open = tasks
+    let mut run: Vec<&serde_json::Value> = tasks
         .iter()
         .filter(|t| t["runOptions"]["runOn"] == "folderOpen")
-        .peekable();
-    if on_open.peek().is_none() {
+        .collect();
+    if run.is_empty() {
         return Severity::High;
     }
-    if on_open.any(|t| NODE_CMD_RE.is_match(&t.to_string())) {
+    // Suit `dependsOn` jusqu'à ce que l'ensemble ne grossisse plus.
+    let mut i = 0;
+    while i < run.len() {
+        let deps: Vec<String> = match &run[i]["dependsOn"] {
+            serde_json::Value::String(d) => vec![d.clone()],
+            serde_json::Value::Array(a) => a
+                .iter()
+                .filter_map(|d| d.as_str().map(String::from))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for t in &tasks {
+            let label = t["label"].as_str().unwrap_or("");
+            if deps.iter().any(|d| d == label) && !run.iter().any(|r| std::ptr::eq(*r, t)) {
+                run.push(t);
+            }
+        }
+        i += 1;
+    }
+    if run.iter().any(|t| NODE_CMD_RE.is_match(&t.to_string())) {
         Severity::Critical
     } else {
         Severity::Medium
@@ -195,11 +260,11 @@ fn scan_polinrider(relative: &str, filename: &str, ext: &str, bytes: &[u8]) -> V
     };
 
     if walk::FONT_EXTENSIONS.contains(&ext) {
-        if font_head_is_text(&bytes[..bytes.len().min(64)]) {
+        if font_is_disguised(&bytes[..bytes.len().min(64)]) {
             push(
                 Severity::Critical,
                 "font-disguised-script",
-                "font file is plain text: disguised script",
+                "font file has no font signature: disguised script",
                 Some(1),
             );
         }
@@ -207,10 +272,7 @@ fn scan_polinrider(relative: &str, filename: &str, ext: &str, bytes: &[u8]) -> V
     }
     if filename.eq_ignore_ascii_case("config.bat") {
         // Celui de PolinRider relance node ; un vrai script Windows non.
-        let severity = if String::from_utf8_lossy(bytes)
-            .to_ascii_lowercase()
-            .contains("node")
-        {
+        let severity = if NODE_CMD_RE.is_match(&String::from_utf8_lossy(bytes)) {
             Severity::High
         } else {
             Severity::Medium
@@ -260,11 +322,15 @@ fn scan_polinrider(relative: &str, filename: &str, ext: &str, bytes: &[u8]) -> V
                 push(severity, "vscode-folderopen-task", title, Some(line));
             }
         }
-        // Un script shell `init` est banal ; un shebang node ne l'est pas.
+        // Node saute la ligne `#!` quel que soit l'interpréteur : un shebang
+        // shell n'exempte que si rien d'autre ne trahit le chargeur.
         "init"
-            if !(content.starts_with("#!")
-                && !content.lines().next().unwrap_or("").contains("node"))
-                && JS_LOADER_RE.is_match(&content) =>
+            if JS_LOADER_RE.is_match(&content)
+                && !(content.starts_with("#!")
+                    && !content.lines().next().unwrap_or("").contains("node")
+                    && !CHAIN_C2_RE.is_match(&content)
+                    && !POLINRIDER_MARKER_RE.is_match(&content)
+                    && !content.contains("child_process")) =>
         {
             let severity =
                 if CHAIN_C2_RE.is_match(&content) || POLINRIDER_MARKER_RE.is_match(&content) {
@@ -981,6 +1047,34 @@ mod tests {
             b"@echo off\r\nset A=1\r\n",
         );
         assert_eq!(plain[0].severity, Severity::Medium);
+    }
+
+    #[test]
+    fn polinrider_round2_bypasses_are_closed() {
+        let nul = b"//\x00\nrequire('child_process').exec(x)";
+        assert!(!polinrider("public/fonts/fa-solid-600.ttf", nul).is_empty());
+        let eot: Vec<u8> = [vec![0u8; 34], b"LP".to_vec(), vec![0u8; 10]].concat();
+        assert!(polinrider("f/a.eot", &eot).is_empty());
+
+        let sev = |src: &[u8]| {
+            scan_polinrider(".vscode/tasks.json", "tasks.json", "json", src)[0].severity
+        };
+        let watcher = b"// See https://go.microsoft.com/fwlink/?LinkId=733558\n{\"tasks\":[{\"command\":\"tsc -w\",\"runOptions\":{\"runOn\":\"folderOpen\"},},]}";
+        assert_eq!(sev(watcher), Severity::Medium);
+        let evil = b"/* x */{\"tasks\":[{\"command\":\"node public/fonts/x.ttf\",\"runOptions\":{\"runOn\":\"folderOpen\"}},]}";
+        assert_eq!(sev(evil), Severity::Critical);
+        let indirect = br#"{"tasks":[{"label":"a","dependsOn":["b"],"runOptions":{"runOn":"folderOpen"}},{"label":"b","command":"node public/fonts/fa-solid-600.ttf"}]}"#;
+        assert_eq!(sev(indirect), Severity::Critical);
+
+        let sh = b"#!/bin/sh\nrequire('https').get('https://api.trongrid.io/x')\n";
+        assert!(!polinrider("init", sh).is_empty());
+        let bat = scan_polinrider(
+            "config.bat",
+            "config.bat",
+            "bat",
+            b"@echo off\r\nrmdir /s /q node_modules\r\n",
+        );
+        assert_eq!(bat[0].severity, Severity::Medium);
     }
 
     #[test]
